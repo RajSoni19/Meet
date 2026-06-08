@@ -1,7 +1,14 @@
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+// Fallbacks keep deployed previews working if environment variables were not
+// configured in the hosting provider yet. These values are public by design.
+const defaultSupabaseUrl = "https://qjpijmlagnyyoubualol.supabase.co";
+const defaultSupabaseAnonKey =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFqcGlqbWxhZ255eW91YnVhbG9sIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA5MTAzMDIsImV4cCI6MjA5NjQ4NjMwMn0.D2B7ijuMD3DzzcJtR6vmslV6FIp7fROK8sFSngdKHsI";
+
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL ?? defaultSupabaseUrl;
+const supabaseAnonKey =
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? defaultSupabaseAnonKey;
 
 /**
  * Browser Supabase client (singleton).
