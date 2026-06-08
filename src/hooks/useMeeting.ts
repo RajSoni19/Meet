@@ -91,6 +91,7 @@ export function useMeeting({
   const channelRef = useRef<RealtimeChannel | null>(null);
   const peersRef = useRef<Map<string, PeerConn>>(new Map());
   const localStreamRef = useRef<MediaStream | null>(localStream);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const localMetaRef = useRef<PeerMeta>({
     id: peerId,
     name: displayName,
@@ -338,6 +339,13 @@ export function useMeeting({
     syncPeerState();
   }, [peerId, createPeer, makeOffer, syncPeerState]);
 
+  const clearReconnectTimer = useCallback(() => {
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+  }, []);
+
   // ---------------------------------------------------------------------------
   // Channel lifecycle
   // ---------------------------------------------------------------------------
@@ -345,34 +353,66 @@ export function useMeeting({
     if (!localStream) return;
     setStatus("connecting");
     const supabase = getSupabase();
-    const channel = supabase.channel(`meet:${code}`, {
-      config: {
-        broadcast: { self: false },
-        presence: { key: peerId },
-      },
-    });
-    channelRef.current = channel;
+    let cancelled = false;
+    let reconnectAttempts = 0;
 
-    channel.on("presence", { event: "sync" }, handlePresenceSync);
-    channel.on("broadcast", { event: "signal" }, ({ payload }) => {
-      void handleSignal(payload as SignalPayload);
-    });
-    channel.on("broadcast", { event: "chat" }, ({ payload }) => {
-      setMessages((prev) => {
-        const msg = payload as ChatMessage;
-        if (prev.some((m) => m.id === msg.id)) return prev;
-        return [...prev, msg];
+    const attachChannel = () => {
+      if (cancelled) return;
+
+      const channel = supabase.channel(`meet:${code}`, {
+        config: {
+          broadcast: { self: false },
+          presence: { key: peerId },
+        },
       });
-    });
 
-    channel.subscribe(async (subStatus) => {
-      if (subStatus === "SUBSCRIBED") {
-        setStatus("connected");
-        await channel.track(localMetaRef.current);
-      } else if (subStatus === "CHANNEL_ERROR" || subStatus === "TIMED_OUT") {
-        setStatus("error");
-      }
-    });
+      channelRef.current = channel;
+
+      channel.on("presence", { event: "sync" }, handlePresenceSync);
+      channel.on("presence", { event: "join" }, handlePresenceSync);
+      channel.on("presence", { event: "leave" }, handlePresenceSync);
+      channel.on("broadcast", { event: "signal" }, ({ payload }) => {
+        void handleSignal(payload as SignalPayload);
+      });
+      channel.on("broadcast", { event: "chat" }, ({ payload }) => {
+        setMessages((prev) => {
+          const msg = payload as ChatMessage;
+          if (prev.some((m) => m.id === msg.id)) return prev;
+          return [...prev, msg];
+        });
+      });
+
+      channel.subscribe(async (subStatus) => {
+        if (cancelled || channelRef.current !== channel) return;
+
+        if (subStatus === "SUBSCRIBED") {
+          clearReconnectTimer();
+          reconnectAttempts = 0;
+          setStatus("connected");
+          await channel.track(localMetaRef.current);
+          handlePresenceSync();
+        } else if (
+          subStatus === "CHANNEL_ERROR" ||
+          subStatus === "TIMED_OUT"
+        ) {
+          setStatus("error");
+          clearReconnectTimer();
+          void supabase.removeChannel(channel);
+          channelRef.current = null;
+
+          if (reconnectAttempts < 3 && !cancelled) {
+            reconnectAttempts += 1;
+            setStatus("connecting");
+            reconnectTimerRef.current = setTimeout(
+              attachChannel,
+              reconnectAttempts * 1000
+            );
+          }
+        }
+      });
+    };
+
+    attachChannel();
 
     // Load chat history
     void supabase
@@ -396,10 +436,15 @@ export function useMeeting({
 
     const peersMap = peersRef.current;
     return () => {
+      cancelled = true;
+      clearReconnectTimer();
       peersMap.forEach((conn) => conn.pc.close());
       peersMap.clear();
-      void channel.untrack();
-      supabase.removeChannel(channel);
+      const channel = channelRef.current;
+      if (channel) {
+        void channel.untrack();
+        supabase.removeChannel(channel);
+      }
       channelRef.current = null;
       setStatus("idle");
     };
