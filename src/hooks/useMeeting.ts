@@ -64,8 +64,10 @@ interface PeerConn {
   pendingCandidates: RTCIceCandidateInit[];
   /** true once we have applied a remote description */
   remoteReady: boolean;
+  /** true once our local tracks have been attached to this connection */
+  localAdded: boolean;
   /** the outgoing video sender, kept so we can replaceTrack (camera <-> screen) */
-  videoSender: RTCRtpSender;
+  videoSender: RTCRtpSender | null;
 }
 
 interface MeetingPeerRow {
@@ -208,28 +210,43 @@ export function useMeeting({
   }, [code]);
 
   // ---------------------------------------------------------------------------
+  // Attach our local audio/video to a peer connection.
+  //
+  // The INITIATOR calls this before creating its offer. The ANSWERER calls it
+  // AFTER setRemoteDescription so addTrack reuses the transceivers created from
+  // the offer (flipping them recvonly -> sendrecv) instead of creating extra,
+  // mismatched m-lines — which is what causes one-way video. Idempotent.
+  // ---------------------------------------------------------------------------
+  const addLocalTracks = useCallback((conn: PeerConn) => {
+    if (conn.localAdded) return;
+    conn.localAdded = true;
+    const local = localStreamRef.current;
+    const aTrack = local?.getAudioTracks()[0];
+    const vTrack = local?.getVideoTracks()[0];
+
+    if (aTrack && local) conn.pc.addTrack(aTrack, local);
+    else conn.pc.addTransceiver("audio", { direction: "recvonly" });
+
+    if (vTrack && local) {
+      conn.videoSender = conn.pc.addTrack(vTrack, local);
+    } else {
+      conn.pc.addTransceiver("video", { direction: "recvonly" });
+    }
+    // Resolve the video sender (covers the answerer case where addTrack reused
+    // an offered transceiver).
+    if (!conn.videoSender) {
+      conn.videoSender =
+        conn.pc.getSenders().find((s) => s.track?.kind === "video") ?? null;
+    }
+  }, []);
+
+  // ---------------------------------------------------------------------------
   // Peer connection factory
   // ---------------------------------------------------------------------------
   const createPeer = useCallback(
-    (remoteId: string, meta: PeerMeta): PeerConn => {
+    (remoteId: string, meta: PeerMeta, isInitiator: boolean): PeerConn => {
       const pc = new RTCPeerConnection({ iceServers: buildIceServers() });
       const stream = new MediaStream();
-
-      // Always create audio+video transceivers in a fixed order so the m-line
-      // layout is identical on both sides. sendrecv lets us replaceTrack later
-      // (toggle camera / screen-share) without renegotiation.
-      const audioTransceiver = pc.addTransceiver("audio", {
-        direction: "sendrecv",
-      });
-      const videoTransceiver = pc.addTransceiver("video", {
-        direction: "sendrecv",
-      });
-
-      const local = localStreamRef.current;
-      const aTrack = local?.getAudioTracks()[0];
-      const vTrack = local?.getVideoTracks()[0];
-      if (aTrack) void audioTransceiver.sender.replaceTrack(aTrack);
-      if (vTrack) void videoTransceiver.sender.replaceTrack(vTrack);
 
       const conn: PeerConn = {
         pc,
@@ -237,9 +254,14 @@ export function useMeeting({
         stream,
         pendingCandidates: [],
         remoteReady: false,
-        videoSender: videoTransceiver.sender,
+        localAdded: false,
+        videoSender: null,
       };
       peersRef.current.set(remoteId, conn);
+
+      // Only the initiator adds tracks up front (then offers). The answerer
+      // adds them after receiving the offer (see handleSignal).
+      if (isInitiator) addLocalTracks(conn);
 
       pc.ontrack = (event) => {
         event.streams[0]?.getTracks().forEach((t) => {
@@ -275,7 +297,7 @@ export function useMeeting({
     },
     // makeOffer is declared below; stable via ref pattern, safe to omit.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [peerId, sendSignal, syncPeerState]
+    [peerId, sendSignal, syncPeerState, addLocalTracks]
   );
 
   // ---------------------------------------------------------------------------
@@ -329,18 +351,19 @@ export function useMeeting({
         let conn = peersRef.current.get(from);
         if (!conn) {
           // We are the answerer; build a peer with placeholder meta until
-          // presence fills it in.
-          conn = createPeer(from, {
-            id: from,
-            name: "Guest",
-            audio: true,
-            video: true,
-            sharing: false,
-          });
+          // presence fills it in. Answerers do not pre-add tracks.
+          conn = createPeer(
+            from,
+            { id: from, name: "Guest", audio: true, video: true, sharing: false },
+            false
+          );
         }
         try {
           await conn.pc.setRemoteDescription(payload.sdp);
           conn.remoteReady = true;
+          // Attach our tracks now, so they bind to the offered transceivers and
+          // we both send AND receive media (fixes one-way video).
+          addLocalTracks(conn);
           await flushCandidates(conn);
           const answer = await conn.pc.createAnswer();
           await conn.pc.setLocalDescription(answer);
@@ -377,7 +400,7 @@ export function useMeeting({
         }
       }
     },
-    [peerId, createPeer, flushCandidates, sendSignal]
+    [peerId, createPeer, flushCandidates, sendSignal, addLocalTracks]
   );
 
   /**
@@ -396,9 +419,11 @@ export function useMeeting({
     union.forEach((meta, id) => {
       const existing = peersRef.current.get(id);
       if (!existing) {
-        createPeer(id, meta);
-        // Deterministic initiator: the greater id sends the offer.
-        if (peerId > id) void makeOffer(id);
+        // Deterministic initiator: the greater id offers (and adds tracks now);
+        // the lesser id is the answerer (adds tracks after the offer arrives).
+        const initiator = peerId > id;
+        createPeer(id, meta, initiator);
+        if (initiator) void makeOffer(id);
       } else {
         existing.meta = meta;
       }
@@ -674,7 +699,7 @@ export function useMeeting({
   const replaceVideoTrack = useCallback(async (track: MediaStreamTrack | null) => {
     const tasks: Promise<void>[] = [];
     peersRef.current.forEach((conn) => {
-      tasks.push(conn.videoSender.replaceTrack(track));
+      if (conn.videoSender) tasks.push(conn.videoSender.replaceTrack(track));
     });
     await Promise.all(tasks);
   }, []);
