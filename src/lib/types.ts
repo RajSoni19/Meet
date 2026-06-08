@@ -35,6 +35,7 @@ export interface RemotePeer extends PeerMeta {
 export type SignalKind = "offer" | "answer" | "ice";
 
 export interface SignalPayload {
+  id?: string;
   from: string;
   to: string;
   kind: SignalKind;

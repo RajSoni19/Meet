@@ -7,6 +7,7 @@ import type {
   ChatMessage,
   PeerMeta,
   RemotePeer,
+  SignalKind,
   SignalPayload,
 } from "@/lib/types";
 
@@ -42,6 +43,27 @@ interface PeerConn {
   remoteReady: boolean;
   /** the outgoing video sender, kept so we can replaceTrack (camera <-> screen) */
   videoSender: RTCRtpSender;
+}
+
+interface MeetingPeerRow {
+  meeting_code: string;
+  peer_id: string;
+  name: string;
+  audio: boolean;
+  video: boolean;
+  sharing: boolean;
+  updated_at: string;
+}
+
+interface MeetingSignalRow {
+  id: string;
+  meeting_code: string;
+  sender_id: string;
+  recipient_id: string;
+  kind: string;
+  sdp: RTCSessionDescriptionInit | null;
+  candidate: RTCIceCandidateInit | null;
+  created_at: string;
 }
 
 export type ConnectionStatus = "idle" | "connecting" | "connected" | "error";
@@ -92,6 +114,9 @@ export function useMeeting({
   const peersRef = useRef<Map<string, PeerConn>>(new Map());
   const localStreamRef = useRef<MediaStream | null>(localStream);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const seenSignalIdsRef = useRef<Set<string>>(new Set());
+  const syncInFlightRef = useRef(false);
   const localMetaRef = useRef<PeerMeta>({
     id: peerId,
     name: displayName,
@@ -127,12 +152,32 @@ export function useMeeting({
   // Signaling send
   // ---------------------------------------------------------------------------
   const sendSignal = useCallback((payload: SignalPayload) => {
+    const id =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : Math.random().toString(36).slice(2);
+    const signalPayload = { ...payload, id };
     channelRef.current?.send({
       type: "broadcast",
       event: "signal",
-      payload,
+      payload: signalPayload,
     });
-  }, []);
+    const supabase = getSupabase();
+    void supabase
+      .from("meeting_signals")
+      .insert({
+        id,
+        meeting_code: code,
+        sender_id: payload.from,
+        recipient_id: payload.to,
+        kind: payload.kind,
+        sdp: payload.sdp ?? null,
+        candidate: payload.candidate ?? null,
+      })
+      .then(({ error }) => {
+        if (error) console.warn("[meet] signal persist failed", error.message);
+      });
+  }, [code]);
 
   // ---------------------------------------------------------------------------
   // Peer connection factory
@@ -301,6 +346,85 @@ export function useMeeting({
     [peerId, createPeer, flushCandidates, sendSignal]
   );
 
+  const syncPeersFromDatabase = useCallback(async () => {
+    if (syncInFlightRef.current) return;
+    syncInFlightRef.current = true;
+    try {
+      const supabase = getSupabase();
+      const [{ data: peersData }, { data: signalsData }] = await Promise.all([
+        supabase
+          .from("meeting_peers")
+          .select("meeting_code, peer_id, name, audio, video, sharing, updated_at")
+          .eq("meeting_code", code)
+          .order("updated_at", { ascending: false }),
+        supabase
+          .from("meeting_signals")
+          .select("id, meeting_code, sender_id, recipient_id, kind, sdp, candidate, created_at")
+          .eq("meeting_code", code)
+          .or(`sender_id.eq.${peerId},recipient_id.eq.${peerId}`)
+          .order("created_at", { ascending: true })
+          .limit(100),
+      ]);
+
+      if (peersData) {
+        const nextPeers = new Map<string, PeerMeta>();
+        (peersData as MeetingPeerRow[]).forEach((row) => {
+          if (row.peer_id !== peerId) {
+            nextPeers.set(row.peer_id, {
+              id: row.peer_id,
+              name: row.name,
+              audio: row.audio,
+              video: row.video,
+              sharing: row.sharing,
+            });
+          }
+        });
+
+        nextPeers.forEach((meta, id) => {
+          const existing = peersRef.current.get(id);
+          if (!existing) {
+            createPeer(id, meta);
+            if (peerId > id) void makeOffer(id);
+          } else {
+            existing.meta = meta;
+          }
+        });
+
+        peersRef.current.forEach((conn, id) => {
+          if (!nextPeers.has(id)) {
+            conn.pc.close();
+            peersRef.current.delete(id);
+          }
+        });
+
+        syncPeerState();
+      }
+
+      if (signalsData) {
+        for (const row of signalsData as MeetingSignalRow[]) {
+          if (seenSignalIdsRef.current.has(row.id)) continue;
+          seenSignalIdsRef.current.add(row.id);
+          await handleSignal({
+            id: row.id,
+            from: row.sender_id,
+            to: row.recipient_id,
+            kind: row.kind as SignalKind,
+            sdp: row.sdp ?? undefined,
+            candidate: row.candidate ?? undefined,
+          });
+        }
+
+        if ((signalsData?.length ?? 0) > 0 || (peersData?.length ?? 0) > 0) {
+          setStatus("connected");
+        }
+      }
+    } catch (err) {
+      console.warn("[meet] database sync failed", err);
+    } finally {
+      syncInFlightRef.current = false;
+    }
+  }, [code, createPeer, handleSignal, makeOffer, peerId, syncPeerState]);
+
   // ---------------------------------------------------------------------------
   // Presence handling: reconcile the set of remote peers
   // ---------------------------------------------------------------------------
@@ -410,9 +534,17 @@ export function useMeeting({
           }
         }
       });
+
+      if (pollTimerRef.current) {
+        clearInterval(pollTimerRef.current);
+      }
+      pollTimerRef.current = setInterval(() => {
+        void syncPeersFromDatabase();
+      }, 2000);
     };
 
     attachChannel();
+    void syncPeersFromDatabase();
 
     // Load chat history
     void supabase
@@ -438,6 +570,10 @@ export function useMeeting({
     return () => {
       cancelled = true;
       clearReconnectTimer();
+      if (pollTimerRef.current) {
+        clearInterval(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
       peersMap.forEach((conn) => conn.pc.close());
       peersMap.clear();
       const channel = channelRef.current;
@@ -449,7 +585,7 @@ export function useMeeting({
       setStatus("idle");
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [code, peerId, localStream]);
+  }, [code, localStream, clearReconnectTimer, handlePresenceSync, syncPeersFromDatabase]);
 
   // ---------------------------------------------------------------------------
   // Public API
@@ -458,8 +594,18 @@ export function useMeeting({
     (patch: Partial<Omit<PeerMeta, "id">>) => {
       localMetaRef.current = { ...localMetaRef.current, ...patch };
       void channelRef.current?.track(localMetaRef.current);
+      const supabase = getSupabase();
+      void supabase.from("meeting_peers").upsert({
+        meeting_code: code,
+        peer_id: peerId,
+        name: localMetaRef.current.name,
+        audio: localMetaRef.current.audio,
+        video: localMetaRef.current.video,
+        sharing: localMetaRef.current.sharing,
+        updated_at: new Date().toISOString(),
+      });
     },
-    []
+    [code, peerId]
   );
 
   const replaceVideoTrack = useCallback(async (track: MediaStreamTrack | null) => {
