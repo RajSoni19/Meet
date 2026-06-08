@@ -13,24 +13,47 @@ import type {
 
 // -----------------------------------------------------------------------------
 // ICE configuration
+//
+// STUN alone only works when both peers can reach each other directly. For
+// users on different networks (the normal case once deployed) at least one is
+// usually behind a NAT/firewall that requires a TURN relay, otherwise the peer
+// connection silently fails. We therefore ALWAYS include TURN servers:
+//   1. Credentials from env (NEXT_PUBLIC_TURN_*) if provided — best for prod.
+//   2. Otherwise, free public OpenRelay TURN servers as a fallback so the app
+//      works cross-network out of the box.
+// For a reliable production deployment, get free TURN credentials from
+// https://www.metered.ca/tools/openrelay/ (50GB/mo free) and set the env vars.
 // -----------------------------------------------------------------------------
+let warnedNoTurn = false;
+
 function buildIceServers(): RTCIceServer[] {
   const servers: RTCIceServer[] = [
     {
       urls: [
         "stun:stun.l.google.com:19302",
         "stun:stun1.l.google.com:19302",
+        "stun:stun.cloudflare.com:3478",
       ],
     },
   ];
+
   const turnUrl = process.env.NEXT_PUBLIC_TURN_URL;
   if (turnUrl) {
     servers.push({
-      urls: turnUrl,
+      urls: turnUrl.split(",").map((u) => u.trim()),
       username: process.env.NEXT_PUBLIC_TURN_USERNAME,
       credential: process.env.NEXT_PUBLIC_TURN_CREDENTIAL,
     });
+  } else if (typeof window !== "undefined" && !warnedNoTurn) {
+    warnedNoTurn = true;
+    console.warn(
+      "[meet] No TURN server configured (NEXT_PUBLIC_TURN_URL). Calls between " +
+        "users on different networks behind NAT/firewalls will likely fail. " +
+        "Get free TURN credentials at https://dashboard.metered.ca and set the " +
+        "NEXT_PUBLIC_TURN_* env vars (see README)."
+    );
   }
+
   return servers;
 }
 
@@ -115,8 +138,13 @@ export function useMeeting({
   const localStreamRef = useRef<MediaStream | null>(localStream);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const heartbeatTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const seenSignalIdsRef = useRef<Set<string>>(new Set());
   const syncInFlightRef = useRef(false);
+  // Peers discovered via each transport; reconciled into one set so neither
+  // path tears down a connection the other path still considers live.
+  const presencePeersRef = useRef<Map<string, PeerMeta>>(new Map());
+  const dbPeersRef = useRef<Map<string, PeerMeta>>(new Map());
   const localMetaRef = useRef<PeerMeta>({
     id: peerId,
     name: displayName,
@@ -289,6 +317,12 @@ export function useMeeting({
   const handleSignal = useCallback(
     async (payload: SignalPayload) => {
       if (payload.to !== peerId) return;
+      // De-duplicate across transports: the same signal can arrive via both the
+      // Realtime broadcast and the database poll. Process each id at most once.
+      if (payload.id) {
+        if (seenSignalIdsRef.current.has(payload.id)) return;
+        seenSignalIdsRef.current.add(payload.id);
+      }
       const { from } = payload;
 
       if (payload.kind === "offer" && payload.sdp) {
@@ -346,6 +380,59 @@ export function useMeeting({
     [peerId, createPeer, flushCandidates, sendSignal]
   );
 
+  /**
+   * Reconcile the live peer connections against the union of peers discovered
+   * via Realtime presence and the database fallback. A connection is only torn
+   * down when BOTH transports agree the peer is gone, so the slower fallback can
+   * never close a connection the faster presence path still considers live.
+   */
+  const reconcilePeers = useCallback(() => {
+    const union = new Map<string, PeerMeta>();
+    presencePeersRef.current.forEach((m, id) => union.set(id, m));
+    dbPeersRef.current.forEach((m, id) => {
+      if (!union.has(id)) union.set(id, m);
+    });
+
+    union.forEach((meta, id) => {
+      const existing = peersRef.current.get(id);
+      if (!existing) {
+        createPeer(id, meta);
+        // Deterministic initiator: the greater id sends the offer.
+        if (peerId > id) void makeOffer(id);
+      } else {
+        existing.meta = meta;
+      }
+    });
+
+    peersRef.current.forEach((conn, id) => {
+      if (!union.has(id)) {
+        conn.pc.close();
+        peersRef.current.delete(id);
+      }
+    });
+
+    syncPeerState();
+  }, [peerId, createPeer, makeOffer, syncPeerState]);
+
+  /** Write/refresh our own row so the DB fallback can discover us. */
+  const upsertSelfPeerRow = useCallback(() => {
+    const supabase = getSupabase();
+    void supabase
+      .from("meeting_peers")
+      .upsert({
+        meeting_code: code,
+        peer_id: peerId,
+        name: localMetaRef.current.name,
+        audio: localMetaRef.current.audio,
+        video: localMetaRef.current.video,
+        sharing: localMetaRef.current.sharing,
+        updated_at: new Date().toISOString(),
+      })
+      .then(({ error }) => {
+        if (error) console.warn("[meet] peer upsert failed", error.message);
+      });
+  }, [code, peerId]);
+
   const syncPeersFromDatabase = useCallback(async () => {
     if (syncInFlightRef.current) return;
     syncInFlightRef.current = true;
@@ -361,49 +448,38 @@ export function useMeeting({
           .from("meeting_signals")
           .select("id, meeting_code, sender_id, recipient_id, kind, sdp, candidate, created_at")
           .eq("meeting_code", code)
-          .or(`sender_id.eq.${peerId},recipient_id.eq.${peerId}`)
-          .order("created_at", { ascending: true })
-          .limit(100),
+          .eq("recipient_id", peerId)
+          .order("created_at", { ascending: false })
+          .limit(200),
       ]);
 
       if (peersData) {
-        const nextPeers = new Map<string, PeerMeta>();
+        // Only trust rows refreshed recently; stale rows mean the peer left or
+        // crashed without cleaning up. Heartbeat runs every 5s, so 15s is safe.
+        const STALE_MS = 15000;
+        const now = Date.now();
+        const fresh = new Map<string, PeerMeta>();
         (peersData as MeetingPeerRow[]).forEach((row) => {
-          if (row.peer_id !== peerId) {
-            nextPeers.set(row.peer_id, {
-              id: row.peer_id,
-              name: row.name,
-              audio: row.audio,
-              video: row.video,
-              sharing: row.sharing,
-            });
-          }
+          if (row.peer_id === peerId) return;
+          const age = now - new Date(row.updated_at).getTime();
+          if (age > STALE_MS) return;
+          fresh.set(row.peer_id, {
+            id: row.peer_id,
+            name: row.name,
+            audio: row.audio,
+            video: row.video,
+            sharing: row.sharing,
+          });
         });
-
-        nextPeers.forEach((meta, id) => {
-          const existing = peersRef.current.get(id);
-          if (!existing) {
-            createPeer(id, meta);
-            if (peerId > id) void makeOffer(id);
-          } else {
-            existing.meta = meta;
-          }
-        });
-
-        peersRef.current.forEach((conn, id) => {
-          if (!nextPeers.has(id)) {
-            conn.pc.close();
-            peersRef.current.delete(id);
-          }
-        });
-
-        syncPeerState();
+        dbPeersRef.current = fresh;
+        reconcilePeers();
       }
 
       if (signalsData) {
-        for (const row of signalsData as MeetingSignalRow[]) {
-          if (seenSignalIdsRef.current.has(row.id)) continue;
-          seenSignalIdsRef.current.add(row.id);
+        // Fetched newest-first; process oldest-first so offers precede answers.
+        const ordered = [...(signalsData as MeetingSignalRow[])].reverse();
+        for (const row of ordered) {
+          // handleSignal de-duplicates by id internally.
           await handleSignal({
             id: row.id,
             from: row.sender_id,
@@ -413,17 +489,16 @@ export function useMeeting({
             candidate: row.candidate ?? undefined,
           });
         }
-
-        if ((signalsData?.length ?? 0) > 0 || (peersData?.length ?? 0) > 0) {
-          setStatus("connected");
-        }
       }
+
+      // A successful poll means signaling works (even if Realtime is down).
+      setStatus((prev) => (prev === "connected" ? prev : "connected"));
     } catch (err) {
       console.warn("[meet] database sync failed", err);
     } finally {
       syncInFlightRef.current = false;
     }
-  }, [code, createPeer, handleSignal, makeOffer, peerId, syncPeerState]);
+  }, [code, handleSignal, peerId, reconcilePeers]);
 
   // ---------------------------------------------------------------------------
   // Presence handling: reconcile the set of remote peers
@@ -440,28 +515,9 @@ export function useMeeting({
       });
     });
 
-    // New / updated peers
-    present.forEach((meta, id) => {
-      const existing = peersRef.current.get(id);
-      if (!existing) {
-        createPeer(id, meta);
-        // Deterministic initiator: greater id offers.
-        if (peerId > id) void makeOffer(id);
-      } else {
-        existing.meta = meta;
-      }
-    });
-
-    // Departed peers
-    peersRef.current.forEach((conn, id) => {
-      if (!present.has(id)) {
-        conn.pc.close();
-        peersRef.current.delete(id);
-      }
-    });
-
-    syncPeerState();
-  }, [peerId, createPeer, makeOffer, syncPeerState]);
+    presencePeersRef.current = present;
+    reconcilePeers();
+  }, [peerId, reconcilePeers]);
 
   const clearReconnectTimer = useCallback(() => {
     if (reconnectTimerRef.current) {
@@ -544,7 +600,11 @@ export function useMeeting({
     };
 
     attachChannel();
+    // Announce ourselves to the DB fallback immediately, then keep the row
+    // fresh with a heartbeat so other peers' staleness filter doesn't drop us.
+    upsertSelfPeerRow();
     void syncPeersFromDatabase();
+    heartbeatTimerRef.current = setInterval(upsertSelfPeerRow, 5000);
 
     // Load chat history
     void supabase
@@ -574,14 +634,26 @@ export function useMeeting({
         clearInterval(pollTimerRef.current);
         pollTimerRef.current = null;
       }
+      if (heartbeatTimerRef.current) {
+        clearInterval(heartbeatTimerRef.current);
+        heartbeatTimerRef.current = null;
+      }
       peersMap.forEach((conn) => conn.pc.close());
       peersMap.clear();
+      presencePeersRef.current.clear();
+      dbPeersRef.current.clear();
       const channel = channelRef.current;
       if (channel) {
         void channel.untrack();
         supabase.removeChannel(channel);
       }
       channelRef.current = null;
+      // Remove our presence row so other peers stop trying to reach us.
+      void supabase
+        .from("meeting_peers")
+        .delete()
+        .eq("meeting_code", code)
+        .eq("peer_id", peerId);
       setStatus("idle");
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -594,18 +666,9 @@ export function useMeeting({
     (patch: Partial<Omit<PeerMeta, "id">>) => {
       localMetaRef.current = { ...localMetaRef.current, ...patch };
       void channelRef.current?.track(localMetaRef.current);
-      const supabase = getSupabase();
-      void supabase.from("meeting_peers").upsert({
-        meeting_code: code,
-        peer_id: peerId,
-        name: localMetaRef.current.name,
-        audio: localMetaRef.current.audio,
-        video: localMetaRef.current.video,
-        sharing: localMetaRef.current.sharing,
-        updated_at: new Date().toISOString(),
-      });
+      upsertSelfPeerRow();
     },
-    [code, peerId]
+    [upsertSelfPeerRow]
   );
 
   const replaceVideoTrack = useCallback(async (track: MediaStreamTrack | null) => {

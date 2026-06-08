@@ -60,8 +60,20 @@ NEXT_PUBLIC_SUPABASE_URL=https://your-project-ref.supabase.co
 NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-public-key
 ```
 
-(Optional) Add TURN credentials for reliable connectivity behind strict
-firewalls/NATs — see comments in `.env.local.example`.
+**Add a TURN server (required for real users).** Testing locally with two tabs
+works without TURN, but once deployed, users on different networks (home/office/
+mobile) are behind NATs and firewalls — without a TURN relay their media never
+connects and the call stays stuck on "Connecting…". Get free credentials
+(50 GB/month) at <https://dashboard.metered.ca/> → **TURN Server**, then set:
+
+```
+NEXT_PUBLIC_TURN_URL=turn:standard.relay.metered.ca:80,turn:standard.relay.metered.ca:443?transport=tcp
+NEXT_PUBLIC_TURN_USERNAME=your-username
+NEXT_PUBLIC_TURN_CREDENTIAL=your-password
+```
+
+> `NEXT_PUBLIC_*` vars are inlined at **build time**. After adding them in Vercel
+> (Project Settings → Environment Variables), you **must redeploy**.
 
 ### 4. Run
 
