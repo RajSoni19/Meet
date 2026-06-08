@@ -41,13 +41,24 @@ export default function Lobby({ code, onJoin }: LobbyProps) {
 
     async function init() {
       try {
+        // Always request 720p (with a fixed deviceId too) and noise/echo
+        // processing, otherwise the browser falls back to a low default
+        // resolution (e.g. 640x480) which looks blurry when scaled up.
+        const videoQuality = {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 30 },
+        };
         const constraints: MediaStreamConstraints = {
-          audio: audioDeviceId
-            ? { deviceId: { exact: audioDeviceId } }
-            : true,
+          audio: {
+            ...(audioDeviceId ? { deviceId: { exact: audioDeviceId } } : {}),
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
           video: videoDeviceId
-            ? { deviceId: { exact: videoDeviceId } }
-            : { width: { ideal: 1280 }, height: { ideal: 720 } },
+            ? { deviceId: { exact: videoDeviceId }, ...videoQuality }
+            : videoQuality,
         };
         const stream = await navigator.mediaDevices.getUserMedia(constraints);
         if (cancelled) {

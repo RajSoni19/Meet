@@ -57,6 +57,21 @@ function buildIceServers(): RTCIceServer[] {
   return servers;
 }
 
+/** Bump a video sender's max bitrate and favour resolution over frame rate. */
+async function tuneVideoSender(sender: RTCRtpSender): Promise<void> {
+  try {
+    const params = sender.getParameters();
+    if (!params.encodings || params.encodings.length === 0) {
+      params.encodings = [{}];
+    }
+    params.encodings[0].maxBitrate = 2_500_000; // ~2.5 Mbps for crisp 720p
+    params.degradationPreference = "maintain-resolution";
+    await sender.setParameters(params);
+  } catch (err) {
+    console.debug("[meet] could not tune video sender", err);
+  }
+}
+
 interface PeerConn {
   pc: RTCPeerConnection;
   meta: PeerMeta;
@@ -237,6 +252,13 @@ export function useMeeting({
     if (!conn.videoSender) {
       conn.videoSender =
         conn.pc.getSenders().find((s) => s.track?.kind === "video") ?? null;
+    }
+
+    // Raise the outbound video bitrate and prefer keeping resolution sharp over
+    // a high frame rate. Without a bitrate floor the encoder over-compresses,
+    // which looks blurry — especially when relayed through TURN.
+    if (conn.videoSender) {
+      void tuneVideoSender(conn.videoSender);
     }
   }, []);
 
