@@ -1,0 +1,35 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background-color: #202124;
+  color: #e8eaed;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Mirror the local self-view like Google Meet does */
+.mirror {
+  transform: scaleX(-1);
+}
+
+/* Thin scrollbars for panels */
+.scrollbar-thin::-webkit-scrollbar {
+  width: 8px;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: #5f6368;
+  border-radius: 9999px;
+}
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
