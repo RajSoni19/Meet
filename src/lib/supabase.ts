@@ -6,9 +6,15 @@ const defaultSupabaseUrl = "https://qjpijmlagnyyoubualol.supabase.co";
 const defaultSupabaseAnonKey =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFqcGlqbWxhZ255eW91YnVhbG9sIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA5MTAzMDIsImV4cCI6MjA5NjQ4NjMwMn0.D2B7ijuMD3DzzcJtR6vmslV6FIp7fROK8sFSngdKHsI";
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL ?? defaultSupabaseUrl;
-const supabaseAnonKey =
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? defaultSupabaseAnonKey;
+// .trim() is important: a stray trailing newline/space in the env var (easy to
+// paste into Vercel by accident) ends up URL-encoded as %0A in the Realtime
+// WebSocket apikey and breaks the connection with "HTTP Authentication failed".
+const supabaseUrl = (
+  process.env.NEXT_PUBLIC_SUPABASE_URL ?? defaultSupabaseUrl
+).trim();
+const supabaseAnonKey = (
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? defaultSupabaseAnonKey
+).trim();
 
 /**
  * Browser Supabase client (singleton).

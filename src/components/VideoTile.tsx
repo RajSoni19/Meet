@@ -25,24 +25,52 @@ export default function VideoTile({
   mirror = false,
 }: VideoTileProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
 
+  // A signature of the current track ids so the effects below re-run when a
+  // track is added LATE (audio/video can arrive after the element mounts).
+  const trackSig = stream
+    ? stream
+        .getTracks()
+        .map((t) => t.id)
+        .join(",")
+    : "";
+
+  const showVideo = videoOn || sharing;
+
+  // Attach the stream to the (always-muted) video element for the picture.
   useEffect(() => {
     const el = videoRef.current;
     if (el && stream && el.srcObject !== stream) {
       el.srcObject = stream;
     }
-  }, [stream]);
+  }, [stream, trackSig, showVideo]);
 
-  const showVideo = videoOn || sharing;
+  // Remote audio plays through a DEDICATED <audio> element. The video element
+  // is muted to avoid double audio/echo. Decoupling audio fixes the common bug
+  // where a late-added audio track never plays from the video element. We also
+  // explicitly call play() because autoplay-with-sound can need a nudge.
+  useEffect(() => {
+    if (isLocal) return;
+    const el = audioRef.current;
+    if (!el || !stream) return;
+    if (el.srcObject !== stream) el.srcObject = stream;
+    el.play().catch(() => {
+      /* will retry on next render / user gesture */
+    });
+  }, [stream, trackSig, isLocal]);
 
   return (
     <div className="group relative h-full w-full overflow-hidden rounded-xl bg-surface-light shadow-lg">
+      {/* Dedicated audio sink for the remote participant. */}
+      {!isLocal && <audio ref={audioRef} autoPlay playsInline />}
+
       {showVideo ? (
         <video
           ref={videoRef}
           autoPlay
           playsInline
-          muted={isLocal}
+          muted /* video element is visual-only; audio comes from <audio> above */
           className={`h-full w-full ${sharing ? "object-contain bg-black" : "object-cover"} ${
             mirror && !sharing ? "mirror" : ""
           }`}

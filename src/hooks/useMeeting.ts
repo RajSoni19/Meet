@@ -57,15 +57,15 @@ function buildIceServers(): RTCIceServer[] {
   return servers;
 }
 
-/** Bump a video sender's max bitrate and favour resolution over frame rate. */
+/** Bump a video sender's max bitrate so 720p stays crisp instead of over-compressed. */
 async function tuneVideoSender(sender: RTCRtpSender): Promise<void> {
   try {
     const params = sender.getParameters();
-    if (!params.encodings || params.encodings.length === 0) {
-      params.encodings = [{}];
-    }
+    // Only mutate EXISTING encodings — creating/replacing the encodings array,
+    // or touching read-only fields, throws "Read-only field modified". Encodings
+    // exist only after negotiation, so this runs once the connection is up.
+    if (!params.encodings || params.encodings.length === 0) return;
     params.encodings[0].maxBitrate = 2_500_000; // ~2.5 Mbps for crisp 720p
-    params.degradationPreference = "maintain-resolution";
     await sender.setParameters(params);
   } catch (err) {
     console.debug("[meet] could not tune video sender", err);
@@ -309,6 +309,11 @@ export function useMeeting({
 
       pc.onconnectionstatechange = () => {
         syncPeerState();
+        if (pc.connectionState === "connected") {
+          // Encodings exist now, so the bitrate boost can be applied.
+          const c = peersRef.current.get(remoteId);
+          if (c?.videoSender) void tuneVideoSender(c.videoSender);
+        }
         if (pc.connectionState === "failed") {
           // Attempt an ICE restart from the initiator side.
           if (peerId > remoteId) void makeOffer(remoteId, true);
