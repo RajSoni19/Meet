@@ -1,9 +1,10 @@
 "use client";
 
-import { useMemo, useState, useEffect } from "react";
+import { useMemo, useState, useEffect, useCallback } from "react";
 import { useParams } from "next/navigation";
 import dynamic from "next/dynamic";
 import { generatePeerId } from "@/lib/utils";
+import { recordMeeting } from "@/lib/history";
 
 // Dynamically import components to prevent hydration issues
 const Lobby = dynamic(() => import("@/components/Lobby"), { ssr: false });
@@ -35,10 +36,19 @@ export default function MeetingPage() {
     setMounted(true);
   }, []);
 
+  const handleJoin = useCallback(
+    (config: JoinConfig) => {
+      if (code) recordMeeting({ code, role: "guest" });
+      setJoinConfig(config);
+    },
+    [code]
+  );
+
   if (!mounted) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-surface text-gray-300">
-        Loading...
+      <div className="flex min-h-screen flex-col items-center justify-center gap-4 bg-surface text-gray-300">
+        <div className="h-10 w-10 animate-spin rounded-full border-2 border-surface-lighter border-t-brand-light" />
+        <p className="text-sm text-gray-500">Setting up your meeting…</p>
       </div>
     );
   }
@@ -52,7 +62,7 @@ export default function MeetingPage() {
   }
 
   if (!joinConfig) {
-    return <Lobby code={code} onJoin={setJoinConfig} />;
+    return <Lobby code={code} onJoin={handleJoin} />;
   }
 
   return (

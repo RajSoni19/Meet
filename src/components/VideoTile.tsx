@@ -2,7 +2,7 @@
 
 import { useEffect, useRef } from "react";
 import { MicOffIcon, ScreenShareIcon } from "@/components/Icons";
-import { initials, colorFromString } from "@/lib/utils";
+import { Avatar } from "@/components/ui/Avatar";
 
 interface VideoTileProps {
   stream: MediaStream | null;
@@ -88,7 +88,11 @@ export default function VideoTile({
   }, [stream, trackSig, isLocal]);
 
   return (
-    <div className="group relative h-full w-full overflow-hidden rounded-xl bg-surface-light shadow-lg">
+    <div
+      className={`group relative h-full w-full animate-scale-in overflow-hidden rounded-2xl bg-surface-light shadow-card ring-1 transition-all duration-200 ${
+        sharing ? "ring-brand/50" : "ring-white/5 hover:ring-white/10"
+      }`}
+    >
       {/* Dedicated audio sink for the remote participant. */}
       {!isLocal && <audio ref={audioRef} autoPlay playsInline />}
 
@@ -103,25 +107,27 @@ export default function VideoTile({
           }`}
         />
       ) : (
-        <div className="flex h-full w-full items-center justify-center">
-          <div
-            className="flex h-20 w-20 items-center justify-center rounded-full text-3xl font-medium text-white"
-            style={{ backgroundColor: colorFromString(name) }}
-          >
-            {initials(name)}
-          </div>
+        <div className="flex h-full w-full items-center justify-center bg-gradient-to-br from-surface-light to-surface">
+          <Avatar name={name} size={84} />
         </div>
       )}
 
+      {/* Sharing badge */}
+      {sharing && (
+        <span className="absolute left-3 top-3 flex items-center gap-1.5 rounded-full bg-brand/90 px-2.5 py-1 text-xs font-medium text-white shadow-soft">
+          <ScreenShareIcon width={14} height={14} />
+          Presenting
+        </span>
+      )}
+
       {/* Name + status bar */}
-      <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between gap-2 bg-gradient-to-t from-black/60 to-transparent px-3 py-2">
-        <span className="flex items-center gap-1.5 truncate text-sm font-medium text-white">
-          {sharing && <ScreenShareIcon width={16} height={16} />}
-          {name}
-          {isLocal && " (You)"}
+      <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between gap-2 bg-gradient-to-t from-black/70 via-black/20 to-transparent px-3 pb-2.5 pt-6">
+        <span className="flex min-w-0 items-center gap-1.5 truncate text-sm font-medium text-white drop-shadow">
+          <span className="truncate">{name}</span>
+          {isLocal && <span className="text-gray-300">(You)</span>}
         </span>
         {!audioOn && (
-          <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-red-500 text-white">
+          <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-danger text-white shadow-soft">
             <MicOffIcon width={14} height={14} />
           </span>
         )}

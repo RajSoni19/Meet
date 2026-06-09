@@ -7,7 +7,8 @@ import VideoTile from "@/components/VideoTile";
 import Controls from "@/components/Controls";
 import ChatPanel from "@/components/ChatPanel";
 import ParticipantsPanel from "@/components/ParticipantsPanel";
-import { CopyIcon } from "@/components/Icons";
+import { CopyIcon, PeopleIcon } from "@/components/Icons";
+import { useToast } from "@/components/ui/Toast";
 
 interface RoomProps {
   code: string;
@@ -29,6 +30,17 @@ interface Tile {
 
 export default function Room({ code, peerId, config, onLeave }: RoomProps) {
   const localStream = config.stream;
+  const { toast } = useToast();
+
+  // Meeting timer (UI only).
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setElapsed((e) => e + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const elapsedLabel = `${String(Math.floor(elapsed / 60)).padStart(2, "0")}:${String(
+    elapsed % 60
+  ).padStart(2, "0")}`;
 
   const [audioOn, setAudioOn] = useState(config.audio);
   const [videoOn, setVideoOn] = useState(config.video);
@@ -138,11 +150,12 @@ export default function Room({ code, peerId, config, onLeave }: RoomProps) {
     try {
       await navigator.clipboard.writeText(inviteUrl);
       setCopied(true);
+      toast("Invite link copied to clipboard", "success");
       setTimeout(() => setCopied(false), 2000);
     } catch {
-      /* clipboard unavailable */
+      toast("Couldn't copy the link", "error");
     }
-  }, [inviteUrl]);
+  }, [inviteUrl, toast]);
 
   // ---- Leave on unload ------------------------------------------------------
   useEffect(() => {
@@ -184,31 +197,64 @@ export default function Room({ code, peerId, config, onLeave }: RoomProps) {
   return (
     <div className="flex h-screen flex-col bg-surface text-gray-100">
       {/* Top bar */}
-      <header className="flex items-center justify-between px-4 py-2 text-sm">
-        <div className="flex items-center gap-3">
-          <span className="font-medium">Meetly</span>
-          <span className="hidden text-gray-400 sm:inline">|</span>
-          <span className="hidden font-mono text-gray-300 sm:inline">{code}</span>
+      <header className="flex items-center justify-between gap-2 border-b border-surface-border/60 px-3 py-2.5 sm:px-4">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-brand text-white">
+            <svg width={18} height={18} viewBox="0 0 24 24" fill="currentColor">
+              <path d="M17 10.5V7a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3.5l4 4v-11l-4 4Z" />
+            </svg>
+          </span>
+          <div className="min-w-0">
+            <p className="truncate text-sm font-semibold leading-tight">Meetly</p>
+            <p className="truncate font-mono text-[11px] leading-tight text-gray-500">
+              {code}
+            </p>
+          </div>
         </div>
-        <div className="flex items-center gap-3">
+
+        <div className="flex items-center gap-2">
+          {/* Timer */}
+          <span className="hidden items-center gap-1.5 rounded-full bg-surface-light px-3 py-1.5 text-xs font-medium tabular-nums text-gray-300 sm:flex">
+            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-danger" />
+            {elapsedLabel}
+          </span>
+          {/* Participant count */}
+          <span className="flex items-center gap-1.5 rounded-full bg-surface-light px-3 py-1.5 text-xs font-medium text-gray-300">
+            <PeopleIcon width={14} height={14} />
+            {allTiles.length}
+          </span>
+          {/* Network / connection status */}
           <span
-            className={`hidden items-center gap-1.5 text-xs sm:flex ${
-              status === "connected" ? "text-green-400" : "text-yellow-400"
+            className={`hidden items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium sm:flex ${
+              status === "connected"
+                ? "bg-success/15 text-success"
+                : status === "error"
+                ? "bg-danger/15 text-danger"
+                : "bg-warning/15 text-warning"
             }`}
+            title="Network status"
           >
             <span
               className={`h-2 w-2 rounded-full ${
-                status === "connected" ? "bg-green-400" : "bg-yellow-400"
+                status === "connected"
+                  ? "bg-success"
+                  : status === "error"
+                  ? "bg-danger"
+                  : "animate-pulse bg-warning"
               }`}
             />
-            {status === "connected" ? "Connected" : "Connecting…"}
+            {status === "connected"
+              ? "Connected"
+              : status === "error"
+              ? "Reconnecting"
+              : "Connecting…"}
           </span>
           <button
             onClick={copyInvite}
-            className="flex items-center gap-1.5 rounded-md bg-surface-light px-3 py-1.5 text-xs font-medium text-gray-200 transition hover:bg-surface-lighter"
+            className="flex items-center gap-1.5 rounded-full bg-surface-light px-3 py-1.5 text-xs font-medium text-gray-200 transition hover:bg-surface-lighter active:scale-95"
           >
-            <CopyIcon width={16} height={16} />
-            {copied ? "Copied!" : "Copy link"}
+            <CopyIcon width={15} height={15} />
+            <span className="hidden sm:inline">{copied ? "Copied!" : "Copy link"}</span>
           </button>
         </div>
       </header>
