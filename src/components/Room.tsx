@@ -66,6 +66,16 @@ export default function Room({ code, peerId, config, onLeave }: RoomProps) {
     }
   }, [messages, chatOpen]);
 
+  // Make sure the local tracks' enabled state matches the UI on join (and any
+  // time it changes) — so a participant who joined unmuted is actually sending
+  // audio, not silently disabled by a stale track state.
+  useEffect(() => {
+    localStream.getAudioTracks().forEach((t) => (t.enabled = audioOn));
+  }, [localStream, audioOn]);
+  useEffect(() => {
+    localStream.getVideoTracks().forEach((t) => (t.enabled = videoOn));
+  }, [localStream, videoOn]);
+
   // ---- Toggles --------------------------------------------------------------
   const toggleAudio = useCallback(() => {
     const next = !audioOn;

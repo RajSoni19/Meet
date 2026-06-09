@@ -55,9 +55,36 @@ export default function VideoTile({
     const el = audioRef.current;
     if (!el || !stream) return;
     if (el.srcObject !== stream) el.srcObject = stream;
-    el.play().catch(() => {
-      /* will retry on next render / user gesture */
-    });
+    el.muted = false;
+    el.volume = 1;
+
+    const tryPlay = () => {
+      el.play().catch(() => {
+        /* blocked by autoplay policy — will retry on the next user gesture */
+      });
+    };
+    tryPlay();
+
+    // Browsers (especially on mobile) block audio that starts after page load
+    // until the user interacts. Retry playback on ANY user gesture until it
+    // actually plays, so a remote participant is never silently inaudible.
+    const onGesture = () => {
+      if (el.paused) tryPlay();
+      if (!el.paused) {
+        document.removeEventListener("pointerdown", onGesture);
+        document.removeEventListener("touchstart", onGesture);
+        document.removeEventListener("keydown", onGesture);
+      }
+    };
+    document.addEventListener("pointerdown", onGesture);
+    document.addEventListener("touchstart", onGesture);
+    document.addEventListener("keydown", onGesture);
+
+    return () => {
+      document.removeEventListener("pointerdown", onGesture);
+      document.removeEventListener("touchstart", onGesture);
+      document.removeEventListener("keydown", onGesture);
+    };
   }, [stream, trackSig, isLocal]);
 
   return (
