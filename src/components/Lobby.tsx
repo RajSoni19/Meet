@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { JoinConfig } from "@/app/meeting/[code]/page";
 import {
   MicIcon,
@@ -15,112 +15,136 @@ interface LobbyProps {
   onJoin: (config: JoinConfig) => void;
 }
 
+type Permission = "pending" | "granted" | "denied";
+
 export default function Lobby({ code, onJoin }: LobbyProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const joinedRef = useRef(false);
 
   const [name, setName] = useState("");
   const [audioOn, setAudioOn] = useState(true);
   const [videoOn, setVideoOn] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [ready, setReady] = useState(false);
+  const audioOnRef = useRef(true);
+  const videoOnRef = useRef(true);
+
+  const [permission, setPermission] = useState<Permission>("pending");
+  const [hasAudio, setHasAudio] = useState(false);
+  const [hasVideo, setHasVideo] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [audioDeviceId, setAudioDeviceId] = useState<string>("");
   const [videoDeviceId, setVideoDeviceId] = useState<string>("");
 
-  // Restore a previously used display name.
   useEffect(() => {
     const saved = localStorage.getItem("meetly:name");
     if (saved) setName(saved);
   }, []);
 
-  // Acquire the media stream (and re-acquire when a device is changed).
-  useEffect(() => {
-    let cancelled = false;
+  // ---- Acquire camera + microphone -----------------------------------------
+  const acquire = useCallback(async () => {
+    setPermission("pending");
+    setErrorMsg(null);
+    const videoQuality = {
+      width: { ideal: 1280 },
+      height: { ideal: 720 },
+      frameRate: { ideal: 30 },
+    };
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          ...(audioDeviceId ? { deviceId: { exact: audioDeviceId } } : {}),
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+        video: videoDeviceId
+          ? { deviceId: { exact: videoDeviceId }, ...videoQuality }
+          : videoQuality,
+      });
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+      streamRef.current = stream;
 
-    async function init() {
-      try {
-        // Always request 720p (with a fixed deviceId too) and noise/echo
-        // processing, otherwise the browser falls back to a low default
-        // resolution (e.g. 640x480) which looks blurry when scaled up.
-        const videoQuality = {
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-          frameRate: { ideal: 30 },
-        };
-        const constraints: MediaStreamConstraints = {
-          audio: {
-            ...(audioDeviceId ? { deviceId: { exact: audioDeviceId } } : {}),
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-          video: videoDeviceId
-            ? { deviceId: { exact: videoDeviceId }, ...videoQuality }
-            : videoQuality,
-        };
-        const stream = await navigator.mediaDevices.getUserMedia(constraints);
-        if (cancelled) {
-          stream.getTracks().forEach((t) => t.stop());
+      const aTracks = stream.getAudioTracks();
+      const vTracks = stream.getVideoTracks();
+      setHasAudio(aTracks.length > 0);
+      setHasVideo(vTracks.length > 0);
+      aTracks.forEach((t) => (t.enabled = audioOnRef.current));
+      vTracks.forEach((t) => (t.enabled = videoOnRef.current));
+      if (vTracks.length === 0) setVideoOn(false);
+
+      if (videoRef.current) videoRef.current.srcObject = stream;
+
+      const list = await navigator.mediaDevices.enumerateDevices();
+      setDevices(list);
+      setPermission("granted");
+    } catch (err) {
+      const name = (err as DOMException)?.name || "";
+      console.error("[lobby] getUserMedia failed:", name, err);
+
+      // Camera failed but maybe the mic is fine — try audio only so the user
+      // can at least be heard (the #1 thing people care about).
+      if (name === "NotFoundError" || name === "OverconstrainedError") {
+        try {
+          const audioStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
+          });
+          streamRef.current?.getTracks().forEach((t) => t.stop());
+          streamRef.current = audioStream;
+          setHasAudio(true);
+          setHasVideo(false);
+          setVideoOn(false);
+          const list = await navigator.mediaDevices.enumerateDevices();
+          setDevices(list);
+          setPermission("granted");
+          setErrorMsg("No camera found — you'll join with audio only.");
           return;
-        }
-        // Stop the old stream before swapping.
-        streamRef.current?.getTracks().forEach((t) => t.stop());
-        streamRef.current = stream;
-
-        // Apply current toggle state.
-        stream.getAudioTracks().forEach((t) => (t.enabled = audioOn));
-        stream.getVideoTracks().forEach((t) => (t.enabled = videoOn));
-
-        if (videoRef.current) videoRef.current.srcObject = stream;
-        setReady(true);
-        setError(null);
-
-        // Populate device list (labels are only available after permission).
-        const list = await navigator.mediaDevices.enumerateDevices();
-        if (!cancelled) setDevices(list);
-      } catch (err) {
-        console.error(err);
-        if (!cancelled) {
-          setError(
-            "We couldn't access your camera or microphone. Please allow " +
-              "permissions in your browser and reload."
-          );
-          setReady(true); // allow joining without media
+        } catch {
+          /* fall through to denied */
         }
       }
-    }
 
-    init();
-    return () => {
-      cancelled = true;
-    };
-    // Re-run only when a specific device is chosen.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+      setPermission("denied");
+      setErrorMsg(
+        name === "NotAllowedError" || name === "SecurityError"
+          ? "Camera & microphone access was blocked."
+          : "Couldn't access your camera or microphone."
+      );
+    }
   }, [audioDeviceId, videoDeviceId]);
 
-  // Cleanup on unmount if we never joined.
+  // Request on mount and whenever the chosen device changes.
+  useEffect(() => {
+    acquire();
+  }, [acquire]);
+
+  // Cleanup if the user navigates away without joining.
   useEffect(() => {
     return () => {
-      // Only stop if join wasn't pressed (join hands the stream off).
       if (!joinedRef.current) {
         streamRef.current?.getTracks().forEach((t) => t.stop());
       }
     };
   }, []);
 
-  const joinedRef = useRef(false);
-
   function toggleAudio() {
+    if (!hasAudio) return;
     const next = !audioOn;
     setAudioOn(next);
+    audioOnRef.current = next;
     streamRef.current?.getAudioTracks().forEach((t) => (t.enabled = next));
   }
 
   function toggleVideo() {
+    if (!hasVideo) return;
     const next = !videoOn;
     setVideoOn(next);
+    videoOnRef.current = next;
     streamRef.current?.getVideoTracks().forEach((t) => (t.enabled = next));
   }
 
@@ -129,18 +153,24 @@ export default function Lobby({ code, onJoin }: LobbyProps) {
     localStorage.setItem("meetly:name", displayName);
     const stream = streamRef.current ?? new MediaStream();
     joinedRef.current = true;
-    onJoin({ displayName, audio: audioOn, video: videoOn, stream });
+    onJoin({
+      displayName,
+      audio: audioOn && hasAudio,
+      video: videoOn && hasVideo,
+      stream,
+    });
   }
 
   const audioInputs = devices.filter((d) => d.kind === "audioinput");
   const videoInputs = devices.filter((d) => d.kind === "videoinput");
+  const showVideoPreview = permission === "granted" && videoOn && hasVideo;
 
   return (
     <main className="flex min-h-screen flex-col items-center justify-center gap-8 bg-surface px-4 py-10 lg:flex-row lg:gap-16">
       {/* Preview */}
       <div className="w-full max-w-xl">
         <div className="relative aspect-video overflow-hidden rounded-2xl bg-black shadow-2xl">
-          {videoOn ? (
+          {showVideoPreview ? (
             <video
               ref={videoRef}
               autoPlay
@@ -159,50 +189,94 @@ export default function Lobby({ code, onJoin }: LobbyProps) {
             </div>
           )}
 
-          {/* Toggle controls */}
-          <div className="absolute bottom-4 left-1/2 flex -translate-x-1/2 gap-4">
-            <button
-              onClick={toggleAudio}
-              aria-label={audioOn ? "Turn off microphone" : "Turn on microphone"}
-              className={`flex h-12 w-12 items-center justify-center rounded-full transition ${
-                audioOn
-                  ? "bg-surface-lighter/80 text-white hover:bg-surface-lighter"
-                  : "bg-red-500 text-white hover:bg-red-600"
-              }`}
-            >
-              {audioOn ? <MicIcon /> : <MicOffIcon />}
-            </button>
-            <button
-              onClick={toggleVideo}
-              aria-label={videoOn ? "Turn off camera" : "Turn on camera"}
-              className={`flex h-12 w-12 items-center justify-center rounded-full transition ${
-                videoOn
-                  ? "bg-surface-lighter/80 text-white hover:bg-surface-lighter"
-                  : "bg-red-500 text-white hover:bg-red-600"
-              }`}
-            >
-              {videoOn ? <VideoIcon /> : <VideoOffIcon />}
-            </button>
-          </div>
+          {/* Permission overlay (the in-app prompt) */}
+          {permission !== "granted" && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/80 px-6 text-center">
+              {permission === "pending" ? (
+                <>
+                  <div className="h-10 w-10 animate-spin rounded-full border-2 border-gray-500 border-t-brand-light" />
+                  <p className="text-sm font-medium text-gray-100">
+                    Allow camera &amp; microphone
+                  </p>
+                  <p className="max-w-xs text-xs text-gray-400">
+                    Your browser is asking for permission — click{" "}
+                    <span className="font-semibold text-gray-200">Allow</span>{" "}
+                    so others can see and hear you.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <span className="text-red-400">
+                    <MicOffIcon width={36} height={36} />
+                  </span>
+                  <p className="text-sm font-medium text-gray-100">
+                    Camera &amp; microphone are blocked
+                  </p>
+                  <p className="max-w-xs text-xs text-gray-400">
+                    Click the camera / lock icon in your browser&apos;s address
+                    bar, choose <span className="font-semibold">Allow</span>,
+                    then press the button below.
+                  </p>
+                  <button
+                    onClick={acquire}
+                    className="mt-1 rounded-full bg-brand px-5 py-2 text-sm font-medium text-white transition hover:bg-brand-dark"
+                  >
+                    Allow access &amp; retry
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* Toggle controls (only meaningful once granted) */}
+          {permission === "granted" && (
+            <div className="absolute bottom-4 left-1/2 flex -translate-x-1/2 gap-4">
+              <button
+                onClick={toggleAudio}
+                disabled={!hasAudio}
+                aria-label={audioOn ? "Turn off microphone" : "Turn on microphone"}
+                className={`flex h-12 w-12 items-center justify-center rounded-full transition disabled:opacity-50 ${
+                  audioOn && hasAudio
+                    ? "bg-surface-lighter/80 text-white hover:bg-surface-lighter"
+                    : "bg-red-500 text-white hover:bg-red-600"
+                }`}
+              >
+                {audioOn && hasAudio ? <MicIcon /> : <MicOffIcon />}
+              </button>
+              <button
+                onClick={toggleVideo}
+                disabled={!hasVideo}
+                aria-label={videoOn ? "Turn off camera" : "Turn on camera"}
+                className={`flex h-12 w-12 items-center justify-center rounded-full transition disabled:opacity-50 ${
+                  videoOn && hasVideo
+                    ? "bg-surface-lighter/80 text-white hover:bg-surface-lighter"
+                    : "bg-red-500 text-white hover:bg-red-600"
+                }`}
+              >
+                {videoOn && hasVideo ? <VideoIcon /> : <VideoOffIcon />}
+              </button>
+            </div>
+          )}
         </div>
 
-        {/* Device pickers */}
-        {(audioInputs.length > 0 || videoInputs.length > 0) && (
-          <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <DeviceSelect
-              label="Microphone"
-              value={audioDeviceId}
-              devices={audioInputs}
-              onChange={setAudioDeviceId}
-            />
-            <DeviceSelect
-              label="Camera"
-              value={videoDeviceId}
-              devices={videoInputs}
-              onChange={setVideoDeviceId}
-            />
-          </div>
-        )}
+        {/* Device pickers — shown once access is granted */}
+        {permission === "granted" &&
+          (audioInputs.length > 0 || videoInputs.length > 0) && (
+            <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <DeviceSelect
+                label="Microphone"
+                value={audioDeviceId}
+                devices={audioInputs}
+                onChange={setAudioDeviceId}
+              />
+              <DeviceSelect
+                label="Camera"
+                value={videoDeviceId}
+                devices={videoInputs}
+                onChange={setVideoDeviceId}
+              />
+            </div>
+          )}
       </div>
 
       {/* Join panel */}
@@ -212,9 +286,23 @@ export default function Lobby({ code, onJoin }: LobbyProps) {
           Meeting code: <span className="font-mono text-gray-200">{code}</span>
         </p>
 
-        {error && (
+        {/* Warnings */}
+        {permission === "granted" && !hasAudio && (
+          <p className="mt-4 rounded-md bg-red-500/10 px-4 py-2 text-sm text-red-300">
+            ⚠️ No microphone — others won&apos;t hear you.{" "}
+            <button onClick={acquire} className="font-semibold underline">
+              Try again
+            </button>
+          </p>
+        )}
+        {errorMsg && permission === "granted" && hasAudio && (
           <p className="mt-4 rounded-md bg-yellow-500/10 px-4 py-2 text-sm text-yellow-300">
-            {error}
+            {errorMsg}
+          </p>
+        )}
+        {permission === "denied" && (
+          <p className="mt-4 rounded-md bg-red-500/10 px-4 py-2 text-sm text-red-300">
+            {errorMsg} Allow access above so you can be seen and heard.
           </p>
         )}
 
@@ -223,18 +311,37 @@ export default function Lobby({ code, onJoin }: LobbyProps) {
           name="displayName"
           value={name}
           onChange={(e) => setName(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && ready && handleJoin()}
+          onKeyDown={(e) =>
+            e.key === "Enter" && permission === "granted" && handleJoin()
+          }
           placeholder="Your name"
           className="mt-6 w-full rounded-md border border-surface-lighter bg-surface-light px-4 py-3 text-center text-sm outline-none focus:border-brand-light"
         />
 
-        <button
-          onClick={handleJoin}
-          disabled={!ready}
-          className="mt-4 w-full rounded-full bg-brand px-6 py-3 font-medium text-white transition hover:bg-brand-dark disabled:cursor-not-allowed disabled:opacity-60"
-        >
-          {ready ? "Join now" : "Preparing…"}
-        </button>
+        {permission === "denied" ? (
+          <div className="mt-4 space-y-2">
+            <button
+              onClick={acquire}
+              className="w-full rounded-full bg-brand px-6 py-3 font-medium text-white transition hover:bg-brand-dark"
+            >
+              Allow camera &amp; microphone
+            </button>
+            <button
+              onClick={handleJoin}
+              className="w-full text-xs text-gray-400 underline hover:text-gray-200"
+            >
+              Join without camera &amp; microphone
+            </button>
+          </div>
+        ) : (
+          <button
+            onClick={handleJoin}
+            disabled={permission !== "granted"}
+            className="mt-4 w-full rounded-full bg-brand px-6 py-3 font-medium text-white transition hover:bg-brand-dark disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {permission === "granted" ? "Join now" : "Waiting for access…"}
+          </button>
+        )}
       </div>
     </main>
   );
