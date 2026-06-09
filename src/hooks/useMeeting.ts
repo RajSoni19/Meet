@@ -83,6 +83,8 @@ interface PeerConn {
   localAdded: boolean;
   /** the outgoing video sender, kept so we can replaceTrack (camera <-> screen) */
   videoSender: RTCRtpSender | null;
+  /** timestamp (ms) of our last outgoing offer, used by the reconnect watchdog */
+  lastOfferAt: number;
 }
 
 interface MeetingPeerRow {
@@ -156,6 +158,7 @@ export function useMeeting({
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const heartbeatTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const watchdogTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const seenSignalIdsRef = useRef<Set<string>>(new Set());
   const syncInFlightRef = useRef(false);
   // Peers discovered via each transport; reconciled into one set so neither
@@ -278,6 +281,7 @@ export function useMeeting({
         remoteReady: false,
         localAdded: false,
         videoSender: null,
+        lastOfferAt: 0,
       };
       peersRef.current.set(remoteId, conn);
 
@@ -314,8 +318,12 @@ export function useMeeting({
           const c = peersRef.current.get(remoteId);
           if (c?.videoSender) void tuneVideoSender(c.videoSender);
         }
-        if (pc.connectionState === "failed") {
-          // Attempt an ICE restart from the initiator side.
+        if (
+          pc.connectionState === "failed" ||
+          pc.connectionState === "disconnected"
+        ) {
+          // Attempt an ICE restart from the initiator side. (The watchdog also
+          // covers cases where a peer never reached "connected" at all.)
           if (peerId > remoteId) void makeOffer(remoteId, true);
         }
       };
@@ -334,6 +342,7 @@ export function useMeeting({
     async (remoteId: string, iceRestart = false) => {
       const conn = peersRef.current.get(remoteId);
       if (!conn) return;
+      conn.lastOfferAt = Date.now();
       try {
         const offer = await conn.pc.createOffer({ iceRestart });
         await conn.pc.setLocalDescription(offer);
@@ -349,6 +358,24 @@ export function useMeeting({
     },
     [peerId, sendSignal]
   );
+
+  /**
+   * Reconnect watchdog: re-offer to any peer we are the initiator for that
+   * hasn't reached "connected" within a grace period. Recovers from lost
+   * offers/answers and transient drops — most valuable with 3+ participants
+   * where more connections mean more chances for a signal to go missing.
+   */
+  const runWatchdog = useCallback(() => {
+    const now = Date.now();
+    peersRef.current.forEach((conn, id) => {
+      if (peerId <= id) return; // only the initiator side re-offers
+      const state = conn.pc.connectionState;
+      if (state === "connected" || state === "closed") return;
+      // Re-offer at most every 7s to avoid thrashing.
+      if (now - conn.lastOfferAt < 7000) return;
+      void makeOffer(id, state === "failed" || state === "disconnected");
+    });
+  }, [peerId, makeOffer]);
 
   const flushCandidates = useCallback(async (conn: PeerConn) => {
     while (conn.pendingCandidates.length) {
@@ -657,6 +684,7 @@ export function useMeeting({
     upsertSelfPeerRow();
     void syncPeersFromDatabase();
     heartbeatTimerRef.current = setInterval(upsertSelfPeerRow, 5000);
+    watchdogTimerRef.current = setInterval(runWatchdog, 4000);
 
     // Load chat history
     void supabase
@@ -689,6 +717,10 @@ export function useMeeting({
       if (heartbeatTimerRef.current) {
         clearInterval(heartbeatTimerRef.current);
         heartbeatTimerRef.current = null;
+      }
+      if (watchdogTimerRef.current) {
+        clearInterval(watchdogTimerRef.current);
+        watchdogTimerRef.current = null;
       }
       peersMap.forEach((conn) => conn.pc.close());
       peersMap.clear();
